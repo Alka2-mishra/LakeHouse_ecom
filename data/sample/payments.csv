@@ -1,0 +1,7 @@
+order_id,payment_type,payment_value
+1001,credit_card,57.50
+1002,upi,88.00
+1003,credit_card,29.50
+1004,credit_card,130.00
+1005,upi,54.00
+1006,debit_card,176.00
