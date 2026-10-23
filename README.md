@@ -1,62 +1,54 @@
-# E-commerce Lakehouse
+# E-commerce Lakehouse & Analytics Platform
 
-A local, production-minded **PySpark Bronze → Silver → Gold** project over a small synthetic e-commerce dataset. It demonstrates distributed DataFrame transformations, data quality rejects, rerunnable outputs, Parquet analytics, integration tests, CI, and Power BI-ready exports.
+An end-to-end data engineering project that processes e-commerce data through a **Bronze, Silver, and Gold** pipeline to generate analytics-ready datasets.
 
 ## Architecture
 
+`Source CSVs → Bronze → Silver → Gold → Power BI`
+
+- **Bronze:** Raw input data
+- **Silver:** Cleaned and validated data
+- **Gold:** Business analytics datasets
+
+## Tech Stack
+
+- Python
+- PySpark 3.5.3 and Java 17
+- CSV
+- Power BI
+- Python `unittest`
+
+## Project Structure
+
 ```text
-CSV source files
-  └─ Bronze: immutable per-run source snapshots
-       └─ Silver: typed, deduplicated, validated Parquet tables
-            ├─ quality/rejected_records: rejected source rows + reason
-            └─ Gold: aggregated Parquet tables + CSV export folders → Power BI
-                 └─ metrics.json + logs/pipeline.log
+ecommerce_lakehouse_minimal/
+├── data/sample/       # Sample input CSV files
+├── src/               # Pipeline code
+├── tests/             # Automated tests
+├── powerbi/            # Dashboard guide
+├── output/             # Generated outputs
+├── requirements.txt
+└── README.md
 ```
 
-All layers are built in a temporary sibling directory. A successful run swaps it into place; a failed run leaves the last successful output intact. Gold calculations reuse a cached eligible fact DataFrame, broadcast the small dimensions, and use adaptive query execution. Gold monthly sales are partitioned by month.
+## Run Locally
 
-## Requirements and run
-
-- Python 3.10+
-- Java 17
-- PySpark 3.5.x (`pip install -r requirements.txt`)
-
-On Windows, local Spark writes may additionally require the Hadoop `winutils.exe` binary matching the Hadoop version bundled with PySpark. GitHub Actions runs the integration suite on Linux and does not need that Windows helper.
+Run these commands from the project root:
 
 ```powershell
-python -m pip install -r requirements.txt
-python src/run_pipeline.py --input data/sample --output output --config pipeline_config.json
-```
-
-Set `PIPELINE_SPARK_MASTER` or `PIPELINE_SHUFFLE_PARTITIONS` to override the matching JSON values. For larger deployments, provide a Spark master in configuration and an output filesystem that supports directory rename semantics.
-
-## Data quality
-
-The pipeline checks required identifiers, parseable order dates, positive quantities, nonnegative prices/freight/payment values, duplicate business keys, and missing order/product/customer references. Accepted rows become Silver tables; rejected rows retain the original fields plus `_reject_reason`. The grouped counts are in `output/quality/summary_csv/` and full rejected rows are in Parquet at `output/quality/rejected_records/`.
-
-## Output contract
-
-- `output/bronze/*.csv`: source snapshots.
-- `output/silver/{orders,order_items,products,customers,payments}/`: typed Parquet tables.
-- `output/silver/order_enriched/`: materialized enriched item-grain Parquet view.
-- `output/gold/<table>.parquet/`: analytics tables.
-- `output/gold/<table>_csv/`: Spark CSV export folder, containing a header and one or more `part-*.csv` files. Import each folder with Power BI's **Folder** connector.
-- `output/metrics.json`, `output/logs/pipeline.log`: row counts, quality counts, run status, duration, and execution log.
-
-Gold tables: `sales_by_month`, `sales_by_category`, `top_products`, `customer_summary`, `payment_summary`.
-
-## Tests and CI
-
-```powershell
+python src/run_pipeline.py --input data/sample --output output
 python -m unittest discover -s tests -v
 ```
 
-The integration tests run Spark locally, verify Parquet/CSV/quality/metrics output, and exercise safe reruns. GitHub Actions installs Java 17 and PySpark, then runs the same test suite for pushes and pull requests.
+Generated analytics files are available in `output/gold/` and can be imported into Power BI.
 
-## Power BI and portfolio
+## Future Improvements
 
-Follow [the dashboard guide](powerbi/dashboard_guide.md), open the [web dashboard preview](powerbi/web_dashboard.html), and see [sample results](powerbi/sample_results.md). The browser preview is a self-contained front-end using the included synthetic demo values. The checked-in source data is synthetic; generated output is intentionally ignored by Git. Run the pipeline before taking screenshots, then save report screenshots in `powerbi/screenshots/` and include a short caption and the run's `metrics.json` summary when publishing the portfolio. No real customer data is included.
+- PySpark-based transformations and Parquet storage
+- Incremental processing and Delta Lake
+- CI/CD and pipeline monitoring
 
-## Assumptions
+## Author
 
-Revenue is item price × quantity + freight. Only delivered, shipped, invoiced, and processing orders contribute to Gold sales. Cancelled/unavailable orders remain valid Silver orders but are not included in sales. Payment totals sum payment records associated with eligible orders.
+**Alka Mishra**  
+[GitHub](https://github.com/Alka2-mishra) · [LinkedIn](https://www.linkedin.com/in/alka-mishra-a34408310/)
