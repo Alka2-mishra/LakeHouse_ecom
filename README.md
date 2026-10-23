@@ -55,7 +55,7 @@ The integration tests run Spark locally, verify Parquet/CSV/quality/metrics outp
 
 ## Power BI and portfolio
 
-Follow [the dashboard guide](powerbi/dashboard_guide.md) and see [sample results](powerbi/sample_results.md). The checked-in source data is synthetic demo data; generated output is intentionally ignored by Git. Run the pipeline before taking screenshots, then save report screenshots in `powerbi/screenshots/` and include a short caption and the run's `metrics.json` summary when publishing the portfolio. No real customer data is included.
+Follow [the dashboard guide](powerbi/dashboard_guide.md), open the [web dashboard preview](powerbi/web_dashboard.html), and see [sample results](powerbi/sample_results.md). The browser preview is a self-contained front-end using the included synthetic demo values. The checked-in source data is synthetic; generated output is intentionally ignored by Git. Run the pipeline before taking screenshots, then save report screenshots in `powerbi/screenshots/` and include a short caption and the run's `metrics.json` summary when publishing the portfolio. No real customer data is included.
 
 ## Assumptions
 

@@ -1,5 +1,15 @@
 # Power BI Dashboard Guide
 
+## Browser preview
+
+For a quick web-style preview of the included synthetic sample results, open `powerbi/web_dashboard.html` directly or serve the repository root:
+
+```powershell
+python -m http.server 8765 --bind 127.0.0.1
+```
+
+Then visit `http://127.0.0.1:8765/powerbi/web_dashboard.html`. This self-contained front-end is a sample preview; the Power BI instructions below use the pipeline's exported data.
+
 ## Refresh the data
 
 Run from the repository root:
