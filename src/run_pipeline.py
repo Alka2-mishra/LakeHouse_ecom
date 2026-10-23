@@ -1,242 +1,255 @@
-"""Lightweight, standard-library-only e-commerce medallion pipeline."""
+"""Configurable PySpark Bronze/Silver/Gold pipeline for the demo store."""
 from __future__ import annotations
 
 import argparse
-import csv
+import json
+import logging
+import os
 import shutil
-from collections import defaultdict
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+import sys
+import time
+import uuid
 from pathlib import Path
 
+from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
+
 INPUT_FILES = ("orders.csv", "order_items.csv", "products.csv", "customers.csv", "payments.csv")
+VALID_STATUSES = ("delivered", "shipped", "invoiced", "processing")
+SCHEMAS = {
+    "orders": T.StructType([T.StructField("order_id", T.StringType()), T.StructField("customer_id", T.StringType()), T.StructField("order_status", T.StringType()), T.StructField("order_date", T.StringType())]),
+    "order_items": T.StructType([T.StructField("order_id", T.StringType()), T.StructField("product_id", T.StringType()), T.StructField("quantity", T.StringType()), T.StructField("price", T.StringType()), T.StructField("freight_value", T.StringType())]),
+    "products": T.StructType([T.StructField("product_id", T.StringType()), T.StructField("product_name", T.StringType()), T.StructField("category", T.StringType())]),
+    "customers": T.StructType([T.StructField("customer_id", T.StringType()), T.StructField("customer_city", T.StringType()), T.StructField("customer_state", T.StringType())]),
+    "payments": T.StructType([T.StructField("order_id", T.StringType()), T.StructField("payment_type", T.StringType()), T.StructField("payment_value", T.StringType())]),
+}
 
 
-def read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open("r", newline="", encoding="utf-8-sig") as f:
-        return [{k: (v or "").strip() for k, v in row.items()} for row in csv.DictReader(f)]
-
-
-def write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
+def configure_logging(path: Path) -> logging.Logger:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+    logger = logging.getLogger("ecommerce_pipeline")
+    logger.setLevel(logging.INFO)
+    for old_handler in logger.handlers[:]:
+        logger.removeHandler(old_handler)
+        old_handler.close()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(path, encoding="utf-8")):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
 
 
-def money(value: str) -> Decimal:
-    try:
-        return Decimal(value or "0").quantize(Decimal("0.01"))
-    except (InvalidOperation, ValueError):
-        return Decimal("0.00")
+def read_source(spark: SparkSession, path: Path, schema: T.StructType) -> DataFrame:
+    return (spark.read.option("header", True).option("mode", "PERMISSIVE")
+            .option("encoding", "UTF-8").schema(schema).csv(str(path)))
 
 
-def integer(value: str, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def nonblank(column: str):
+    return F.col(column).isNotNull() & (F.trim(F.col(column)) != "")
 
 
-def parse_date(value: str):
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        return None
+def split_quality(df: DataFrame, valid, reasons) -> tuple[DataFrame, DataFrame]:
+    reason_expr = F.concat_ws(";", *[
+        F.when(condition, F.lit(reason)) for condition, reason in reasons
+    ])
+    tagged = df.withColumn("_reject_reason", reason_expr)
+    accepted = tagged.filter(valid).drop("_reject_reason")
+    rejected = tagged.filter(~valid)
+    return accepted, rejected
 
 
-def main(input_dir: str, output_dir: str) -> None:
-    source = Path(input_dir)
-    output = Path(output_dir)
+def deduplicate(df: DataFrame, keys: list[str]) -> tuple[DataFrame, DataFrame]:
+    from pyspark.sql import Window
+    tie_breakers = [F.col(column).asc_nulls_first() for column in df.columns]
+    ranked = df.withColumn("_duplicate_rank", F.row_number().over(Window.partitionBy(*keys).orderBy(*tie_breakers)))
+    duplicates = ranked.filter(F.col("_duplicate_rank") > 1).drop("_duplicate_rank").withColumn("_reject_reason", F.lit("duplicate_key"))
+    unique = ranked.filter(F.col("_duplicate_rank") == 1).drop("_duplicate_rank")
+    return unique, duplicates
+
+
+def write_parquet(df: DataFrame, path: Path, partitions: list[str] | None = None) -> None:
+    writer = df.write.mode("overwrite")
+    if partitions:
+        writer = writer.partitionBy(*partitions)
+    writer.parquet(str(path))
+
+
+def run_pipeline(input_dir: str, output_dir: str, config: dict | None = None) -> dict:
+    config = config or {}
+    source = Path(input_dir).resolve()
+    target = Path(output_dir).resolve()
     missing = [name for name in INPUT_FILES if not (source / name).is_file()]
     if missing:
-        raise FileNotFoundError(
-            f"Missing required input file(s) in {source}: {', '.join(missing)}"
-        )
+        raise FileNotFoundError(f"Missing required input file(s) in {source}: {', '.join(missing)}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run_id = uuid.uuid4().hex[:10]
+    stage = target.parent / f".{target.name}.staging-{run_id}"
+    backup = target.parent / f".{target.name}.backup-{run_id}"
+    stage.mkdir()
+    logger = configure_logging(stage / "logs" / "pipeline.log")
+    started = time.monotonic()
+    spark = (SparkSession.builder.appName(config.get("app_name", "ecommerce-medallion"))
+             .master(config.get("master", "local[*]"))
+             .config("spark.sql.shuffle.partitions", str(config.get("shuffle_partitions", 4)))
+             .config("spark.sql.adaptive.enabled", "true")
+             .getOrCreate())
+    spark.sparkContext.setLogLevel(config.get("spark_log_level", "WARN"))
+    metrics: dict = {"run_id": run_id, "status": "running", "input_dir": str(source), "tables": {}, "quality": {}}
+    try:
+        bronze = stage / "bronze"
+        bronze.mkdir()
+        for name in INPUT_FILES:
+            shutil.copy2(source / name, bronze / name)
 
-    bronze = output / "bronze"
-    silver = output / "silver"
-    gold = output / "gold"
-    for folder in (bronze, silver, gold):
-        folder.mkdir(parents=True, exist_ok=True)
+        raw = {name: read_source(spark, bronze / f"{name}.csv", schema)
+               for name, schema in SCHEMAS.items()}
+        for name, frame in raw.items():
+            metrics["tables"][f"bronze_{name}"] = frame.count()
 
-    # Bronze: preserve raw files as source snapshots.
-    for name in INPUT_FILES:
-        shutil.copy2(source / name, bronze / name)
+        rejects: list[DataFrame] = []
+        # Canonicalize strings before validation and typed casts.
+        orders0 = raw["orders"].select(*[F.trim(F.col(c)).alias(c) for c in raw["orders"].columns])
+        orders0 = orders0.withColumn("order_date", F.to_date("order_date", "yyyy-MM-dd"))
+        orders, bad = split_quality(orders0,
+            nonblank("order_id") & nonblank("customer_id") & F.col("order_date").isNotNull(),
+            [(~nonblank("order_id"), "missing_order_id"), (~nonblank("customer_id"), "missing_customer_id"), (F.col("order_date").isNull(), "invalid_order_date")])
+        orders, dup = deduplicate(orders, ["order_id"]); rejects += [bad, dup]
+        orders = orders.withColumn("order_status", F.lower(F.when(F.trim("order_status") == "", F.lit("unknown")).otherwise(F.coalesce("order_status", F.lit("unknown")))))
 
-    raw_orders = read_csv(bronze / "orders.csv")
-    raw_items = read_csv(bronze / "order_items.csv")
-    raw_products = read_csv(bronze / "products.csv")
-    raw_customers = read_csv(bronze / "customers.csv")
-    raw_payments = read_csv(bronze / "payments.csv")
+        items0 = raw["order_items"].select(*[F.trim(F.col(c)).alias(c) for c in raw["order_items"].columns])
+        items0 = (items0.withColumn("quantity", F.col("quantity").cast("int"))
+                  .withColumn("price", F.col("price").cast("decimal(12,2)"))
+                  .withColumn("freight_value", F.col("freight_value").cast("decimal(12,2)")))
+        item_valid = (nonblank("order_id") & nonblank("product_id") & (F.col("quantity") > 0) &
+                      F.col("price").isNotNull() & (F.col("price") >= 0) & F.col("freight_value").isNotNull() & (F.col("freight_value") >= 0))
+        items, bad = split_quality(items0, item_valid, [
+            (~nonblank("order_id"), "missing_order_id"), (~nonblank("product_id"), "missing_product_id"),
+            (F.col("quantity").isNull() | (F.col("quantity") <= 0), "invalid_quantity"),
+            (F.col("price").isNull() | (F.col("price") < 0), "invalid_price"),
+            (F.col("freight_value").isNull() | (F.col("freight_value") < 0), "invalid_freight")])
+        items, dup = deduplicate(items, ["order_id", "product_id"]); rejects += [bad, dup]
 
-    # Silver: normalize and validate each entity.
-    orders = []
-    for row in raw_orders:
-        dt = parse_date(row.get("order_date", ""))
-        order_id = row.get("order_id", "")
-        customer_id = row.get("customer_id", "")
-        if not order_id or not customer_id or dt is None:
-            continue
-        orders.append({
-            "order_id": order_id,
-            "customer_id": customer_id,
-            "order_status": row.get("order_status", "").lower() or "unknown",
-            "order_date": dt.isoformat(),
-        })
+        products0 = raw["products"].select(*[F.trim(F.col(c)).alias(c) for c in raw["products"].columns])
+        products, bad = split_quality(products0, nonblank("product_id"), [(~nonblank("product_id"), "missing_product_id")])
+        products, dup = deduplicate(products, ["product_id"]); rejects += [bad, dup]
+        products = products.withColumn("product_name", F.when(F.trim("product_name") == "", F.lit("Unknown")).otherwise(F.coalesce("product_name", F.lit("Unknown")))).withColumn("category", F.when(F.trim("category") == "", F.lit("Uncategorized")).otherwise(F.coalesce("category", F.lit("Uncategorized"))))
 
-    items = []
-    for row in raw_items:
-        order_id, product_id = row.get("order_id", ""), row.get("product_id", "")
-        qty = integer(row.get("quantity", ""))
-        if not order_id or not product_id or qty <= 0:
-            continue
-        items.append({
-            "order_id": order_id,
-            "product_id": product_id,
-            "quantity": qty,
-            "price": money(row.get("price", "")),
-            "freight_value": money(row.get("freight_value", "")),
-        })
+        customers0 = raw["customers"].select(*[F.trim(F.col(c)).alias(c) for c in raw["customers"].columns])
+        customers, bad = split_quality(customers0, nonblank("customer_id"), [(~nonblank("customer_id"), "missing_customer_id")])
+        customers, dup = deduplicate(customers, ["customer_id"]); rejects += [bad, dup]
+        for col in ("customer_city", "customer_state"):
+            customers = customers.withColumn(col, F.when(F.trim(col) == "", F.lit("Unknown")).otherwise(F.coalesce(col, F.lit("Unknown"))))
 
-    products = [
-        {"product_id": r["product_id"], "product_name": r["product_name"] or "Unknown",
-         "category": r["category"] or "Uncategorized"}
-        for r in raw_products if r.get("product_id")
-    ]
-    customers = [
-        {"customer_id": r["customer_id"], "customer_city": r.get("customer_city", "") or "Unknown",
-         "customer_state": r.get("customer_state", "") or "Unknown"}
-        for r in raw_customers if r.get("customer_id")
-    ]
-    payments = [
-        {"order_id": r["order_id"], "payment_type": r.get("payment_type", "").lower() or "unknown",
-         "payment_value": money(r.get("payment_value", ""))}
-        for r in raw_payments if r.get("order_id")
-    ]
+        payments0 = raw["payments"].select(*[F.trim(F.col(c)).alias(c) for c in raw["payments"].columns]).withColumn("payment_value", F.col("payment_value").cast("decimal(12,2)"))
+        payments, bad = split_quality(payments0, nonblank("order_id") & F.col("payment_value").isNotNull() & (F.col("payment_value") >= 0),
+            [(~nonblank("order_id"), "missing_order_id"), (F.col("payment_value").isNull() | (F.col("payment_value") < 0), "invalid_payment_value")])
+        payments = payments.withColumn("payment_type", F.lower(F.when(F.trim("payment_type") == "", F.lit("unknown")).otherwise(F.coalesce("payment_type", F.lit("unknown")))))
+        rejects.append(bad)
 
-    write_csv(silver / "orders_clean.csv", orders,
-              ["order_id", "customer_id", "order_status", "order_date"])
-    write_csv(silver / "order_items_clean.csv",
-              [{**r, "price": f'{r["price"]:.2f}', "freight_value": f'{r["freight_value"]:.2f}'} for r in items],
-              ["order_id", "product_id", "quantity", "price", "freight_value"])
-    write_csv(silver / "products_clean.csv", products, ["product_id", "product_name", "category"])
-    write_csv(silver / "customers_clean.csv", customers, ["customer_id", "customer_city", "customer_state"])
-    write_csv(silver / "payments_clean.csv",
-              [{**r, "payment_value": f'{r["payment_value"]:.2f}'} for r in payments],
-              ["order_id", "payment_type", "payment_value"])
+        # Reject valid-shaped facts whose foreign keys do not resolve.
+        order_keys = orders.select("order_id").distinct()
+        product_keys = products.select("product_id").distinct()
+        customer_keys = customers.select("customer_id").distinct()
+        dangling_items = (items.join(order_keys, "order_id", "left_anti").withColumn("_reject_reason", F.lit("missing_order_reference"))
+                         .unionByName(items.join(product_keys, "product_id", "left_anti").withColumn("_reject_reason", F.lit("missing_product_reference")), allowMissingColumns=True))
+        items = items.join(order_keys, "order_id", "inner").join(product_keys, "product_id", "inner")
+        dangling_orders = orders.join(customer_keys, "customer_id", "left_anti").withColumn("_reject_reason", F.lit("missing_customer_reference"))
+        orders = orders.join(customer_keys, "customer_id", "inner")
+        rejects += [dangling_items, dangling_orders]
+        valid_payment_orders = orders.select("order_id").distinct()
+        rejects.append(payments.join(valid_payment_orders, "order_id", "left_anti").withColumn("_reject_reason", F.lit("missing_order_reference")))
+        payments = payments.join(valid_payment_orders, "order_id", "inner")
 
-    order_by_id = {r["order_id"]: r for r in orders}
-    product_by_id = {r["product_id"]: r for r in products}
-    customer_by_id = {r["customer_id"]: r for r in customers}
-    payment_by_order = defaultdict(list)
-    for payment in payments:
-        payment_by_order[payment["order_id"]].append(payment)
+        silver = stage / "silver"
+        silver.mkdir()
+        clean = {"orders": orders, "order_items": items, "products": products, "customers": customers, "payments": payments}
+        for name, frame in clean.items():
+            count = frame.count()
+            metrics["tables"][f"silver_{name}"] = count
+            write_parquet(frame, silver / name)
+        rejected = rejects[0]
+        for frame in rejects[1:]:
+            rejected = rejected.unionByName(frame, allowMissingColumns=True)
+        quality = rejected.groupBy("_reject_reason").count().withColumnRenamed("_reject_reason", "reason").withColumnRenamed("count", "rejected_rows")
+        metrics["quality"]["rejected_rows"] = rejected.count()
+        metrics["quality"]["reasons"] = {r["reason"]: r["rejected_rows"] for r in quality.collect()}
+        write_parquet(rejected, stage / "quality" / "rejected_records")
+        quality.coalesce(1).write.mode("overwrite").option("header", True).csv(str(stage / "quality" / "summary_csv"))
 
-    # Enriched order-item grain. Cancelled/unavailable orders remain in Silver but are excluded from Gold.
-    enriched = []
-    for item in items:
-        order = order_by_id.get(item["order_id"])
-        if not order:
-            continue
-        product = product_by_id.get(item["product_id"], {"product_name": "Unknown", "category": "Uncategorized"})
-        customer = customer_by_id.get(order["customer_id"], {"customer_city": "Unknown", "customer_state": "Unknown"})
-        item_revenue = item["price"] * item["quantity"] + item["freight_value"]
-        enriched.append({
-            "order_id": order["order_id"],
-            "customer_id": order["customer_id"],
-            "order_date": order["order_date"],
-            "order_status": order["order_status"],
-            "product_id": item["product_id"],
-            "product_name": product["product_name"],
-            "category": product["category"],
-            "quantity": item["quantity"],
-            "price": f'{item["price"]:.2f}',
-            "freight_value": f'{item["freight_value"]:.2f}',
-            "item_revenue": f'{item_revenue:.2f}',
-            "customer_city": customer["customer_city"],
-            "customer_state": customer["customer_state"],
-        })
-    write_csv(silver / "order_enriched.csv", enriched, [
-        "order_id", "customer_id", "order_date", "order_status", "product_id",
-        "product_name", "category", "quantity", "price", "freight_value",
-        "item_revenue", "customer_city", "customer_state"
-    ])
+        # Broadcast dimension lookups and retain a single cached eligible fact frame for all Gold aggregates.
+        enriched = (items.join(orders, "order_id").join(F.broadcast(products), "product_id")
+                   .join(F.broadcast(customers), "customer_id")
+                   .withColumn("item_revenue", F.col("price") * F.col("quantity") + F.col("freight_value")))
+        write_parquet(enriched, silver / "order_enriched")
+        metrics["tables"]["silver_order_enriched"] = enriched.count()
+        eligible = enriched.filter(F.col("order_status").isin(*VALID_STATUSES)).cache()
+        eligible.count()
+        gold = stage / "gold"
+        gold.mkdir()
+        gold_tables = {
+            "sales_by_month": eligible.groupBy(F.date_format("order_date", "yyyy-MM").alias("month")).agg(F.sum("item_revenue").alias("revenue"), F.countDistinct("order_id").alias("order_count"), F.sum("quantity").alias("units_sold")),
+            "sales_by_category": eligible.groupBy("category").agg(F.sum("item_revenue").alias("revenue"), F.countDistinct("order_id").alias("order_count"), F.sum("quantity").alias("units_sold")),
+            "top_products": eligible.groupBy("product_id", "product_name", "category").agg(F.sum("item_revenue").alias("revenue"), F.countDistinct("order_id").alias("order_count"), F.sum("quantity").alias("units_sold")),
+            "customer_summary": eligible.groupBy("customer_id").agg(F.countDistinct("order_id").alias("orders"), F.sum("item_revenue").alias("revenue")).withColumn("average_order_value", F.col("revenue") / F.col("orders")),
+        }
+        payments_gold = payments.join(orders.filter(F.col("order_status").isin(*VALID_STATUSES)).select("order_id"), "order_id").groupBy("payment_type").agg(F.sum("payment_value").alias("payment_value"), F.count(F.lit(1)).alias("payment_count"))
+        gold_tables["payment_summary"] = payments_gold
+        for name, frame in gold_tables.items():
+            if name != "sales_by_month":
+                frame = frame.orderBy(F.desc("revenue") if "revenue" in frame.columns else F.desc("payment_value"))
+            count = frame.count()
+            metrics["tables"][f"gold_{name}"] = count
+            write_parquet(frame, gold / f"{name}.parquet", ["month"] if name == "sales_by_month" else None)
+            frame.coalesce(1).write.mode("overwrite").option("header", True).option("encoding", "UTF-8").csv(str(gold / f"{name}_csv"))
+        eligible.unpersist()
+        metrics["status"] = "success"
+        metrics["duration_seconds"] = round(time.monotonic() - started, 3)
+        (stage / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        logger.info("Pipeline completed: %s", json.dumps(metrics, sort_keys=True))
+        spark.stop()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+        if target.exists():
+            target.rename(backup)
+        try:
+            stage.rename(target)
+        except Exception:
+            if backup.exists():
+                backup.rename(target)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+        return metrics
+    except Exception:
+        metrics["status"] = "failed"
+        metrics["duration_seconds"] = round(time.monotonic() - started, 3)
+        logger.exception("Pipeline failed")
+        try:
+            spark.stop()
+        finally:
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
+                handler.close()
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
 
-    eligible_statuses = {"delivered", "shipped", "invoiced", "processing"}
-    eligible = [r for r in enriched if r["order_status"] in eligible_statuses]
-    monthly = defaultdict(lambda: {"revenue": Decimal("0"), "orders": set(), "units": 0})
-    category = defaultdict(lambda: {"revenue": Decimal("0"), "orders": set(), "units": 0})
-    product = defaultdict(lambda: {"revenue": Decimal("0"), "orders": set(), "units": 0})
-    customer = defaultdict(lambda: {"revenue": Decimal("0"), "orders": set()})
 
-    for row in eligible:
-        rev = money(row["item_revenue"])
-        month = row["order_date"][:7]
-        monthly[month]["revenue"] += rev
-        monthly[month]["orders"].add(row["order_id"])
-        monthly[month]["units"] += integer(str(row["quantity"]))
-        category[row["category"]]["revenue"] += rev
-        category[row["category"]]["orders"].add(row["order_id"])
-        category[row["category"]]["units"] += integer(str(row["quantity"]))
-        product[row["product_id"]]["revenue"] += rev
-        product[row["product_id"]]["orders"].add(row["order_id"])
-        product[row["product_id"]]["units"] += integer(str(row["quantity"]))
-        customer[row["customer_id"]]["revenue"] += rev
-        customer[row["customer_id"]]["orders"].add(row["order_id"])
+def load_config(path: str | None) -> dict:
+    config = json.loads(Path(path).read_text(encoding="utf-8")) if path else {}
+    for key, env in (("master", "PIPELINE_SPARK_MASTER"), ("shuffle_partitions", "PIPELINE_SHUFFLE_PARTITIONS")):
+        if env in os.environ:
+            config[key] = int(os.environ[env]) if key == "shuffle_partitions" else os.environ[env]
+    return config
 
-    monthly_rows = [{
-        "month": key, "revenue": f'{val["revenue"]:.2f}',
-        "order_count": len(val["orders"]), "units_sold": val["units"]
-    } for key, val in sorted(monthly.items())]
-    category_rows = [{
-        "category": key, "revenue": f'{val["revenue"]:.2f}',
-        "order_count": len(val["orders"]), "units_sold": val["units"]
-    } for key, val in sorted(category.items(), key=lambda x: x[1]["revenue"], reverse=True)]
-    product_rows = []
-    for product_id, val in sorted(product.items(), key=lambda x: x[1]["revenue"], reverse=True):
-        prod = product_by_id.get(product_id, {"product_name": "Unknown", "category": "Uncategorized"})
-        product_rows.append({
-            "product_id": product_id, "product_name": prod["product_name"], "category": prod["category"],
-            "revenue": f'{val["revenue"]:.2f}', "order_count": len(val["orders"]), "units_sold": val["units"]
-        })
-    customer_rows = []
-    for customer_id, val in sorted(customer.items(), key=lambda x: x[1]["revenue"], reverse=True):
-        customer_rows.append({
-            "customer_id": customer_id, "orders": len(val["orders"]), "revenue": f'{val["revenue"]:.2f}',
-            "average_order_value": f'{(val["revenue"] / len(val["orders"])):.2f}' if val["orders"] else "0.00"
-        })
 
-    payment_totals = defaultdict(lambda: {"value": Decimal("0"), "count": 0})
-    eligible_order_ids = {r["order_id"] for r in orders if r["order_status"] in eligible_statuses}
-    for payment in payments:
-        if payment["order_id"] in eligible_order_ids:
-            payment_totals[payment["payment_type"]]["value"] += payment["payment_value"]
-            payment_totals[payment["payment_type"]]["count"] += 1
-    payment_rows = [{
-        "payment_type": key, "payment_value": f'{val["value"]:.2f}', "payment_count": val["count"]
-    } for key, val in sorted(payment_totals.items(), key=lambda x: x[1]["value"], reverse=True)]
-
-    write_csv(gold / "sales_by_month.csv", monthly_rows, ["month", "revenue", "order_count", "units_sold"])
-    write_csv(gold / "sales_by_category.csv", category_rows, ["category", "revenue", "order_count", "units_sold"])
-    write_csv(gold / "top_products.csv", product_rows,
-              ["product_id", "product_name", "category", "revenue", "order_count", "units_sold"])
-    write_csv(gold / "customer_summary.csv", customer_rows,
-              ["customer_id", "orders", "revenue", "average_order_value"])
-    write_csv(gold / "payment_summary.csv", payment_rows, ["payment_type", "payment_value", "payment_count"])
-
-    print("Pipeline completed successfully.")
-    print(f"Bronze: {bronze}")
-    print(f"Silver: {silver}")
-    print(f"Gold:   {gold}")
-    print(f"Rows processed: orders={len(orders)}, items={len(items)}, enriched_items={len(enriched)}")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the PySpark e-commerce medallion pipeline.")
+    parser.add_argument("--input", default="data/sample")
+    parser.add_argument("--output", default="output")
+    parser.add_argument("--config", help="Optional JSON Spark and pipeline configuration.")
+    args = parser.parse_args()
+    run_pipeline(args.input, args.output, load_config(args.config))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the lightweight e-commerce medallion pipeline.")
-    parser.add_argument("--input", default="data/sample", help="Folder containing the five source CSV files.")
-    parser.add_argument("--output", default="output", help="Folder where Bronze/Silver/Gold CSVs are written.")
-    args = parser.parse_args()
-    main(args.input, args.output)
+    main()

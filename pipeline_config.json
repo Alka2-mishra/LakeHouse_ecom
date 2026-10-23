@@ -1,0 +1,6 @@
+{
+  "app_name": "ecommerce-medallion",
+  "master": "local[*]",
+  "shuffle_partitions": 4,
+  "spark_log_level": "WARN"
+}
